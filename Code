@@ -1,0 +1,337 @@
+import pandas as pd
+import numpy as np
+import ast
+from fuzzywuzzy import process
+from sklearn.metrics.pairwise import cosine_similarity
+
+"""# ratings data"""
+
+# Load data in chunks
+chunk_size = 1000000
+ratings_chunks = pd.read_csv(r"file.path", usecols=['userId', 'movieId', 'rating'], chunksize=chunk_size)
+
+# Process chunks until reaching the ratings for the first million users
+user_ratings_list = []
+total_ratings_processed = 0
+for chunk in ratings_chunks:
+    chunk = chunk.dropna()
+    user_ratings = chunk.groupby('userId').apply(lambda x: x.set_index('movieId')['rating'])
+    user_ratings_list.append(user_ratings)
+    total_ratings_processed += len(chunk)
+    if total_ratings_processed >= 1000000:
+        break
+
+# Concatenate results from processed chunks
+user_ratings = pd.concat(user_ratings_list)
+
+# Continue with the remaining code as before
+user_item_matrix = user_ratings.unstack(fill_value=0)
+user_item_matrix.reset_index(inplace=True)
+user_item_matrix.set_index('userId', inplace=True)
+
+""" movies df, preprocessed"""
+
+# movies dataset
+
+movies_df = pd.read_csv(r"file.path", usecols=['title', 'id', 'imdb_id', 'genres'])
+
+# print(movies_df)
+
+# import ast
+
+# Convert strings in the 'genres' column to lists of dictionaries
+movies_df['genres'] = movies_df['genres'].apply(ast.literal_eval)
+
+# Extract genre names from the list of dictionaries in the 'genres' column
+movies_df['genre_names'] = movies_df['genres'].apply(lambda x: [genre['name'] for genre in x])
+
+
+# Drop duplicates based on the 'imdb_id' column
+# they correspond to unique titles
+movies_df = movies_df.drop_duplicates(subset=['imdb_id'])
+# Drop duplicates based on the 'imdb_id' column
+movies_df = movies_df.drop_duplicates(subset=['title'])
+# bc will be looking by title
+
+# Identify rows with non-integer values in the 'id' column
+non_integer_ids_mask = ~movies_df['id'].str.strip().str.isdigit()
+non_integer_ids = movies_df.loc[non_integer_ids_mask, 'id']
+
+# Remove rows with non-integer values
+movies_df = movies_df[~non_integer_ids_mask]
+
+# Strip leading and trailing whitespaces from 'id' column
+movies_df['id'] = movies_df['id'].str.strip()
+
+# Convert 'id' column to integers
+movies_df['id'] = movies_df['id'].astype(int)
+
+
+""" missing movies"""
+
+# Get the movie IDs in the user-item matrix columns
+user_item_movie_ids = set(user_item_matrix.columns)
+
+# Get the movie IDs in the movies DataFrame
+movies_df_movie_ids = set(movies_df['id'])
+
+# Find missing movie IDs in the user-item matrix columns
+missing_movie_ids = user_item_movie_ids - movies_df_movie_ids
+
+# Drop columns from the user_item_matrix that are not found in the movies DataFrame
+user_item_matrix = user_item_matrix.drop(columns=missing_movie_ids)
+
+# Get the movie IDs in the user-item matrix columns again after dropping columns
+user_item_movie_ids = set(user_item_matrix.columns)
+
+# Find missing movie IDs in the movies DataFrame that were not found in the user-item matrix columns
+missing_movie_ids_movies_df = movies_df_movie_ids - user_item_movie_ids
+
+# Drop rows with missing movie IDs from the movies DataFrame
+moviesCleaned_df = movies_df[~movies_df['id'].isin(missing_movie_ids_movies_df)]
+
+# Filter user-item matrix to keep only movie IDs present in cleaned movies DataFrame
+user_item_matrix = user_item_matrix[moviesCleaned_df['id']]
+
+# Check the new shape of the user_item_matrix after filtering
+
+# Set the 'id' column as the index of moviesCleaned_df
+moviesCleaned_df.set_index('id', inplace=True)
+
+""" get user movie choice and rating"""
+
+# Function to prompt user for a movie title
+def prompt_for_movie_title(movies):
+    while True:
+        title = input("Enter the title of the movie you watched: ").lower()  # Convert input to lowercase
+        exact_match = movies[movies['title'].str.lower() == title]  # Check for exact match
+        if not exact_match.empty:
+            return exact_match['title'].iloc[0]  # Return exact match
+        else:
+            # Perform fuzzy matching to find similar movie titles
+            matches = process.extract(title, movies['title'].str.lower(), limit=5)  # Convert titles to lowercase for matching
+            print("Did you mean one of these?")
+            for i, match in enumerate(matches, start=1):
+                print(f"{i}. {match[0]}")  # Print the matched movie title with corresponding number
+            while True:
+                choice = input("Enter the number of the movie or 'retry' to try again: ")
+                if choice.isdigit() and 1 <= int(choice) <= len(matches):
+                    return matches[int(choice) - 1][0]  # Return the exact title corresponding to the chosen number
+                elif choice.lower() == 'retry' or choice.lower() == 'r':
+                    break  # Prompt user to retry if requested
+                else:
+                    print("Invalid input. Please enter a valid number or 'retry'.")
+
+
+# Function to prompt user for a rating
+def prompt_for_rating():
+    while True:
+        rating = input("Enter your rating for the movie (1 to 5 stars): ")
+        if rating.isdigit() and 1 <= int(rating) <= 5:
+            return int(rating)  # Return valid rating
+        else:
+            print("Invalid input. Please enter a rating between 1 and 5.")
+
+# Main function to collect user's movie ratings
+def collect_user_ratings():
+    user_ratings = {}
+    while True:
+        movie_title = prompt_for_movie_title(moviesCleaned_df)
+        rating = prompt_for_rating()
+        user_ratings[movie_title] = rating
+        while True:
+            another_movie = input("Do you want to rate another movie? (yes/no): ").lower()
+            if another_movie in ['yes', 'no', 'y', 'n']:
+                break
+            else:
+                print("Invalid input. Please enter 'yes' or 'no'.")
+        if another_movie == 'no' or another_movie == 'n':
+            break
+    return user_ratings
+
+# Example usage
+user_ratings = collect_user_ratings()
+
+""" new user matrix"""
+
+moviesCleaned_df.reset_index(inplace=True)
+
+def create_new_user_matrix(user_ratings, moviesCleaned_df):
+    # Extract unique movie IDs from user_ratings
+    unique_movie_ids = [moviesCleaned_df[moviesCleaned_df['title'].str.lower() == movie.lower()]['id'].iloc[0]
+                        for movie in user_ratings.keys()]
+
+    # Create a new DataFrame for the new user with movie IDs as columns
+    new_user_matrix = pd.DataFrame(0, index=['new_user'], columns=unique_movie_ids)
+
+    # Update the ratings in the new user matrix
+    for movie_title, rating in user_ratings.items():
+        movie_id = moviesCleaned_df[moviesCleaned_df['title'].str.lower() == movie_title.lower()]['id'].iloc[0]
+        new_user_matrix.at['new_user', movie_id] = rating
+
+    return new_user_matrix
+
+# Example usage
+new_user_matrix = create_new_user_matrix(user_ratings, moviesCleaned_df)
+
+""" simple collab filtering system? cosine sim between common ids first"""
+
+# Identify common movie IDs based on column names
+common_movie_ids = list(user_item_matrix.columns.intersection(new_user_matrix.columns))
+
+# Update ratings for the new user in user_item_matrix
+for movie_id in common_movie_ids:
+    user_item_matrix.at['new_user', movie_id] = new_user_matrix.at['new_user', movie_id]
+
+# Fill missing values (NaN) with appropriate fill value (e.g., 0)
+user_item_matrix.fillna(0, inplace=True)
+
+""" colab filtering
+get similar user (cosine sim), find their other movies not rated by new user
+"""
+
+# from sklearn.metrics.pairwise import cosine_similarity
+
+common_movie_ids = list(common_movie_ids)  # Convert set to list
+
+
+# Exclude the last row (new user) when extracting the previous user subset
+previous_user_subset = user_item_matrix.iloc[:-1][common_movie_ids]
+
+
+# Extract the new user subset directly from the new_user_matrix
+new_user_subset = new_user_matrix[common_movie_ids]
+
+
+# Step 3: Compute cosine similarity between previous users and new user
+cosine_sim = cosine_similarity(previous_user_subset, new_user_subset)
+
+# Step 4: Identify top-N users most similar to the new user
+top_n = 10   # Specify the number of similar users to find
+
+# Compute mean similarity score for each previous user
+mean_cosine_sim = cosine_sim.mean(axis=1)
+
+# Find indices of top-N users with highest mean similarity scores
+top_n_similar_user_indices = np.argsort(mean_cosine_sim)[::-1][:top_n]
+
+# Get cosine similarity values for top-N similar users
+top_n_cosine_sim_values = mean_cosine_sim[top_n_similar_user_indices]
+
+
+# Step 5: Get the ratings of the top-N similar users for the movies they have rated
+top_n_similar_user_ratings = user_item_matrix.iloc[top_n_similar_user_indices]
+
+# Step 6: Filter out the movies that the new user has already rated
+new_user_rated_movies = user_item_matrix.loc['new_user']
+unrated_movies = new_user_rated_movies[new_user_rated_movies == 0].index
+
+# Step 7: Compute weights based on cosine similarity values
+weights = top_n_cosine_sim_values
+
+# Step 8: Reshape weights to match the dimensions of top_n_similar_user_ratings[unrated_movies]
+weights = weights.reshape(-1, 1)
+
+# Step 9: Aggregate ratings of top-N similar users for unrated movies with weights
+aggregated_ratings = (top_n_similar_user_ratings[unrated_movies] * weights).sum()
+
+# Step 10: Recommend the top-rated movies to the new user
+top_recommended_movies = aggregated_ratings.sort_values(ascending=False).head(50)  # Adjust the number of recommendations as needed
+
+# Assuming 'movieId' column contains the IDs, set it as the index
+moviesCleaned_df.set_index('id', inplace=True)
+
+# Fetch movie titles and genres from moviesCleaned_df
+recommended_movies_info = moviesCleaned_df.loc[top_recommended_movies.index]
+
+# Print the new user's rated movies with genres
+print('\n*************************************** Input Movies ****************************************\n')
+print(f"+{'-' * 40}+{'-' * 70}+{'-' * 20}+")
+print(f"| {'Title':<38} | {'Genres':<68} | {'Rating':^18} |")
+print(f"+{'-' * 40}+{'-' *70}+{'-' * 20}+")
+for movie_title, rating in user_ratings.items():
+    movie_info = moviesCleaned_df[moviesCleaned_df['title'].str.lower() == movie_title.lower()]
+    if not movie_info.empty:
+        genres = movie_info['genre_names'].values[0]
+        print(f"| {movie_title:<38} | {str(genres):<68} | {rating:^18} |")
+    else:
+        print(f"| {movie_title:<38} | {'N/A':<68} | {rating:^18} |")
+print(f"+{'-' * 40}+{'-' * 70}+{'-' * 20}+")
+
+# Assuming user_ratings is a dictionary mapping movie titles to ratings
+# Assuming recommended_movie_info is a DataFrame with columns 'movieId' and 'genre_names'
+
+# Calculate average rating per genre from the new user's input movies
+genre_ratings = {}
+for movie_title, rating in user_ratings.items():
+    movie_info = moviesCleaned_df[moviesCleaned_df['title'].str.lower() == movie_title.lower()]
+    if not movie_info.empty:
+        genres = movie_info['genre_names'].values[0]
+        for genre in genres:
+            genre = genre.strip()
+            if genre not in genre_ratings:
+                genre_ratings[genre] = [rating]
+            else:
+                genre_ratings[genre].append(rating)
+
+# Calculate average rating per genre
+average_genre_ratings = {genre: sum(ratings) / len(ratings) for genre, ratings in genre_ratings.items()}
+
+# Convert top_recommended_movies to a DataFrame with a 'movieId' column
+top_recommended_movies_df = top_recommended_movies.reset_index()
+top_recommended_movies_df.columns = ['movieId', 'weighted_rating']
+
+# Create a copy of top_recommended_movies_df to avoid modifying the original DataFrame
+updated_top_recommended_movies_df = top_recommended_movies_df.copy()
+
+# Add genre-based weights to top_recommended_movies_df
+for index, row in updated_top_recommended_movies_df.iterrows():
+    movie_id = row['movieId']
+    movie_info = recommended_movies_info.loc[movie_id]
+    genres_list = movie_info['genre_names']
+    for genre in genres_list:
+        genre = genre.strip()
+        if genre in average_genre_ratings:
+            if average_genre_ratings[genre] < 2:
+                updated_top_recommended_movies_df.loc[index, 'weighted_rating'] -= average_genre_ratings[genre]*3
+            elif average_genre_ratings[genre] < 3:
+                updated_top_recommended_movies_df.loc[index, 'weighted_rating'] -= average_genre_ratings[genre]
+            else:
+                updated_top_recommended_movies_df.loc[index, 'weighted_rating'] += average_genre_ratings[genre]
+
+# Sort updated_top_recommended_movies_df by weighted rating in descending order
+sorted_top_recommended_movies_df = updated_top_recommended_movies_df.sort_values(by='weighted_rating', ascending=False)
+
+# Get the top 5 recommended movies
+top_10_movies = sorted_top_recommended_movies_df.head(5)
+print('\n\n************************************** Using Hybrid Recommendation System **********************************************')
+
+# Display the top 10 recommended movies
+print("\nTop 5 recommended movies:")
+print(f"+{'-' * 40}+{'-' * 85}+{'-' * 20}+")
+print(f"| {'Title':<38} | {'Genres':<83} | {'Weighted Rating':^18} |")
+print(f"+{'-' * 40}+{'-' *85}+{'-' * 20}+")
+for index, row in top_10_movies.iterrows():
+    title = recommended_movies_info.loc[row['movieId'], 'title']
+    genres = recommended_movies_info.loc[row['movieId'], 'genre_names']
+    print(f"| {title:<38} | {str(genres):<83} | {row['weighted_rating']:^18.1f} |")
+print(f"+{'-' * 40}+{'-' * 85}+{'-' * 20}+")
+
+# Step 10: Recommend the top-rated movies to the new user
+top_recommended_movies = top_recommended_movies.sort_values(ascending=False).head(5)  # Adjust the number of recommendations as needed
+
+# Fetch movie titles and genres from moviesCleaned_df
+recommended_movies_info = moviesCleaned_df.loc[top_recommended_movies.index]
+
+print('\n\n************************************** Using Collaborative Filtering **********************************************')
+
+# Print the recommended movies with titles, genres, and ratings
+print("\nTop recommended movies:")
+print(f"+{'-' * 40}+{'-' * 85}+{'-' * 20}+")
+print(f"| {'Title':<38} | {'Genres':<83} | {'Weighted Rating':^18} |")
+print(f"+{'-' * 40}+{'-' * 85}+{'-' * 20}+")
+for movie_id, rating in top_recommended_movies.items():
+    title = recommended_movies_info.loc[movie_id, 'title']
+    genres = recommended_movies_info.loc[movie_id, 'genre_names']
+    print(f"| {title:<38} | {str(genres):<83} | {rating:^18.1f} |")
+print(f"+{'-' * 40}+{'-' * 85}+{'-' * 20}+")
